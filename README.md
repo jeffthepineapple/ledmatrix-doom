@@ -23,13 +23,19 @@ You must provide your own Doom WAD file. This project does not include `DOOM.WAD
 Basic run:
 
 ```sh
-python doom.py --iwad DOOM.WAD
+python doom.py --iwad /path/to/DOOM.WAD
 ```
 
-Example with faster settings:
+Best settings found so far:
 
 ```sh
-python doom.py --iwad DOOM.WAD --fps 30 --serial-workers 10 --preview-scale 7 --reverse-ports
+python doom.py --iwad /path/to/DOOM.WAD --fps 60 --serial-workers 2 --preview-scale 7 --no-cie --gamma 2.2 --brightness 65 --contrast 1.1
+```
+
+If the left and right LED panels are swapped, add `--reverse-ports`:
+
+```sh
+python doom.py --iwad /path/to/DOOM.WAD --fps 60 --serial-workers 2 --preview-scale 7 --no-cie --gamma 2.2 --brightness 65 --contrast 1.1 --reverse-ports
 ```
 
 List detected LED Matrix modules:
