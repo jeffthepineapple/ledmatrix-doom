@@ -14,16 +14,16 @@ Dependencies:
     python -m pip install --user --break-system-packages pyserial pygame pillow numpy vizdoom
 
 Run:
-    python led.py --iwad DOOM.WAD
+    python doom.py --iwad DOOM.WAD
 
 Recommended first test:
-    python led.py --iwad DOOM.WAD --fps 14 --serial-workers 1 --preview-scale 7
+    python doom.py --iwad DOOM.WAD --fps 14 --serial-workers 1 --preview-scale 7
 
 Then try:
-    python led.py --iwad DOOM.WAD --fps 24 --serial-workers 2 --preview-scale 7
+    python doom.py --iwad DOOM.WAD --fps 24 --serial-workers 2 --preview-scale 7
 
 For more FPS after confirming LEDs work:
-    python led.py --iwad DOOM.WAD --fps 30 --serial-workers 2 --preview-scale 0 --no-autocontrast --levels 16 --min-change 4 --dither none
+    python doom.py --iwad DOOM.WAD --fps 30 --serial-workers 2 --preview-scale 0 --no-autocontrast --levels 16 --min-change 4 --dither none
 """
 
 import argparse
@@ -972,7 +972,7 @@ def main() -> int:
     if not devices:
         print("No Framework LED Matrix modules detected.")
         print("Try:")
-        print("  python led.py --port /dev/ttyACM0 --port /dev/ttyACM1 --iwad DOOM.WAD")
+        print("  python doom.py --port /dev/ttyACM0 --port /dev/ttyACM1 --iwad DOOM.WAD")
         return 1
 
     print(f"Found {len(devices)} LED Matrix module(s): {', '.join(devices)}")
