@@ -18,6 +18,8 @@ python -m pip install --user --break-system-packages pyserial pygame pillow nump
 
 ## Run
 
+You must provide your own Doom WAD file. This project does not include `DOOM.WAD`.
+
 Basic run:
 
 ```sh
