@@ -79,6 +79,13 @@ python doom.py --list
 - `--no-autocontrast` - Disable per-frame autocontrast.
 - `--autocontrast-cutoff N` - Autocontrast cutoff percent. Default: `1.0`.
 
+## Screen mirror to the keyboard
+
+Moved to [`fw16-screen-mirror`](https://github.com/jeffthepineapple/fw16-screen-mirror):
+streams the display to the Framework 16 keyboard backlight over QMK raw HID,
+plus the custom firmware (`0xF0` host-control protocol) that implements it.
+Unrelated to the LED Matrix modules `doom.py` drives.
+
 ## Controls
 
 Use the game window to play. Press `Ctrl+C` in the terminal to stop and clear the LED matrices.
