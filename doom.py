@@ -45,11 +45,10 @@ import signal
 import sys
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import serial
-import serial.tools.list_ports
+from ledmatrix import Device, list_devices, open_device
 from PIL import Image, ImageOps
 
 
@@ -85,7 +84,7 @@ SERIAL_SETTLE_SECONDS = 0.45
 # Keep this at 1 so we always send the most recent frame, not a stale one.
 SERIAL_QUEUE_DEPTH = 1
 
-OPEN_PORTS: List[serial.Serial]         = []
+OPEN_PORTS: List[Device]              = []
 CLEANING_UP                             = False
 LAST_PANEL_FRAMES: Dict[str, np.ndarray] = {}
 
@@ -164,40 +163,32 @@ def build_lut(cie: bool, gamma: float, levels: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Serial helpers
+# LED Matrix SDK helpers
 # ---------------------------------------------------------------------------
 
 def find_led_matrix_ports() -> List[str]:
     return sorted(
-        p.device
-        for p in serial.tools.list_ports.comports()
-        if p.vid == FRAMEWORK_VID and p.pid == LED_MATRIX_PID
+        d.path
+        for d in list_devices()
     )
 
 
-def port_key(port: serial.Serial) -> str:
-    return str(getattr(port, "port", id(port)))
+def port_key(port: Device) -> str:
+    info = getattr(port, "info", None)
+    return str(getattr(info, "path", getattr(port, "port", id(port))))
 
 
 def make_packet(cmd: int, payload: bytes = b"") -> bytes:
     return FWK_MAGIC + bytes([cmd]) + payload
 
 
-def write_exact(port: serial.Serial, packet: bytes, retries: int = 2, retry_delay: float = 0.05) -> bool:
+def write_exact(port: Device, packet: bytes, retries: int = 2, retry_delay: float = 0.05) -> bool:
+    """Compatibility shim for old serial code paths; prefer SDK methods below."""
     for attempt in range(max(1, retries)):
         try:
-            if not port or not getattr(port, "is_open", False):
-                return False
-            written = port.write(packet)
-            if written == len(packet):
-                return True
-            raise serial.SerialTimeoutException(f"Short write: {written}/{len(packet)}")
-        except (serial.SerialTimeoutException, serial.SerialException, OSError):
-            try:
-                if port and getattr(port, "is_open", False):
-                    port.reset_output_buffer()
-            except Exception:
-                pass
+            port.raw_command(packet[2], packet[3:])
+            return True
+        except Exception:
             if attempt + 1 < retries:
                 time.sleep(retry_delay)
     return False
@@ -208,15 +199,30 @@ def send_cmd(port, cmd, payload=b"", retries=2, retry_delay=0.05) -> bool:
 
 
 def set_global_brightness_percent(port, percent, retries=3) -> bool:
-    return send_cmd(port, CMD_BRIGHTNESS, bytes([int(round(max(0, min(100, int(percent))) * 255 / 100))]), retries=retries)
+    try:
+        port.set_brightness(int(max(0, min(100, int(percent)))))
+        return True
+    except Exception:
+        return False
 
 
 def set_sleeping(port, sleeping, retries=3) -> bool:
-    return send_cmd(port, CMD_SLEEPING, bytes([1 if sleeping else 0]), retries=retries)
+    try:
+        if sleeping:
+            port.sleep()
+        else:
+            port.wake()
+        return True
+    except Exception:
+        return False
 
 
 def set_animate(port, animate, retries=3) -> bool:
-    return send_cmd(port, CMD_ANIMATE, bytes([1 if animate else 0]), retries=retries)
+    try:
+        port.set_animation(bool(animate))
+        return True
+    except Exception:
+        return False
 
 
 def blank_gray_panel() -> np.ndarray:
@@ -224,7 +230,7 @@ def blank_gray_panel() -> np.ndarray:
 
 
 def draw_gray_frame(
-    port: serial.Serial,
+    port: Device,
     panel_gray: np.ndarray,
     retries: int = 1,
     force: bool = False,
@@ -247,28 +253,21 @@ def draw_gray_frame(
     if not changed_columns:
         return True
 
-    # ----- burst mode (default) -----
-    if serial_burst:
-        parts = [make_packet(CMD_STAGE_GRAY_COL, bytes([x]) + frame[:, x].tobytes())
-                 for x in changed_columns]
-        parts.append(make_packet(CMD_FLUSH_GRAY))
-        ok = write_exact(port, b"".join(parts), retries=retries, retry_delay=0.02)
-        if ok:
-            LAST_PANEL_FRAMES[key] = frame.copy()
-        return ok
-
-    # ----- safe mode (--no-serial-burst) -----
-    for x in changed_columns:
-        if not send_cmd(port, CMD_STAGE_GRAY_COL, bytes([x]) + frame[:, x].tobytes(), retries=retries):
-            return False
-    ok = send_cmd(port, CMD_FLUSH_GRAY, b"", retries=retries)
-    if ok:
+    try:
+        if force or not serial_burst or len(changed_columns) == PANEL_WIDTH:
+            port.set_grayscale(frame.tolist())
+        else:
+            for x in changed_columns:
+                port.stage_column(int(x), [int(v) for v in frame[:, x]])
+            port.flush_columns()
         LAST_PANEL_FRAMES[key] = frame.copy()
-    return ok
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
-# Non-blocking serial worker (one per port)
+# Non-blocking device worker (one per module)
 # ---------------------------------------------------------------------------
 
 class SerialWorker:
@@ -278,7 +277,7 @@ class SerialWorker:
     discarded so we always process the most recent one (low-latency mode).
     """
 
-    def __init__(self, port: serial.Serial, queue_depth: int = SERIAL_QUEUE_DEPTH):
+    def __init__(self, port: Device, queue_depth: int = SERIAL_QUEUE_DEPTH):
         self._port   = port
         self._queue: queue.Queue = queue.Queue(maxsize=queue_depth)
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -319,11 +318,10 @@ class SerialWorker:
 SERIAL_WORKERS: List[SerialWorker] = []
 
 
-def clear_port(port: serial.Serial) -> None:
+def clear_port(port: Device) -> None:
     try:
         if port and getattr(port, "is_open", False):
             draw_gray_frame(port, blank_gray_panel(), retries=3, force=True, min_change=1, serial_burst=False)
-            port.flush()
     except Exception:
         pass
 
@@ -367,43 +365,60 @@ def signal_handler(signum, frame) -> None:
     raise SystemExit(130)
 
 
-def open_ports(devices: List[str], baud: int = BAUD) -> List[serial.Serial]:
+def _check_port_access(device: str) -> bool:
+    """
+    Report whether `device` is readable+writable by the current user, with
+    actionable (non-sudo) guidance when it is not.  No privilege escalation is
+    ever attempted: running this program as root is never required.
+    """
+    if os.access(device, os.R_OK | os.W_OK):
+        return True
+
+    try:
+        import grp
+        owner_group = grp.getgrgid(os.stat(device).st_gid).gr_name
+    except Exception:
+        owner_group = "uucp"
+
+    print(f"  No read/write access to {device} (owned by group '{owner_group}').")
+    print(f"  Fix once, no sudo afterwards:  sudo gpasswd -a \"$USER\" {owner_group}")
+    print(f"  then re-login (or: newgrp {owner_group}) — do NOT run this script as root.")
+    return False
+
+
+def open_ports(devices: List[str], baud: int = BAUD) -> List[Device]:
     ports = []
     for device in devices:
+        if not _check_port_access(device):
+            continue
         try:
-            port = serial.Serial(device, baud, timeout=SERIAL_READ_TIMEOUT, write_timeout=SERIAL_WRITE_TIMEOUT)
+            # Select by serial *path*; `serial=` means USB serial number, and
+            # both FW16 panels report the same one, so it cannot address them.
+            port = open_device(port=device)
             ports.append(port)
             OPEN_PORTS.append(port)
             print(f"Opened {device}")
-            time.sleep(SERIAL_SETTLE_SECONDS)
-            try:
-                port.reset_input_buffer()
-                port.reset_output_buffer()
-            except Exception:
-                pass
-        except serial.SerialException as e:
+        except Exception as e:
             print(f"Could not open {device}: {e}")
-            print("On Arch Linux: sudo gpasswd -a \"$USER\" uucp  (then re-login)")
     return ports
 
 
-def initialize_matrix(port: serial.Serial, brightness_percent: int) -> None:
-    for _ in range(4):
-        ok  = set_sleeping(port, False, retries=4)
-        time.sleep(0.03)
-        ok &= set_animate(port, False, retries=4)
-        time.sleep(0.03)
-        ok &= set_global_brightness_percent(port, brightness_percent, retries=4)
-        time.sleep(0.03)
-        ok &= draw_gray_frame(port, blank_gray_panel(), retries=4, force=True, min_change=1, serial_burst=False)
-        if ok:
-            try:
-                port.flush()
-            except Exception:
-                pass
-            return
-        time.sleep(0.25)
-    print(f"Warning: startup writes were flaky for {getattr(port, 'port', port)}; continuing.")
+def initialize_matrix(port: Device, brightness_percent: int) -> None:
+    """
+    Wake the matrix and send a blank frame through the ledmatrix SDK.
+    """
+    blank = blank_gray_panel()
+
+    ok = set_sleeping(port, False, retries=4)
+    time.sleep(0.05)
+    ok &= set_animate(port, False, retries=4)
+    time.sleep(0.05)
+    ok &= set_global_brightness_percent(port, brightness_percent, retries=4)
+    time.sleep(0.05)
+    ok &= draw_gray_frame(port, blank, retries=4, force=True, min_change=1, serial_burst=False)
+
+    if not ok:
+        print(f"Warning: could not fully initialise {port_key(port)}; continuing anyway.")
 
 
 # ---------------------------------------------------------------------------
@@ -557,7 +572,7 @@ def transform_canvas(canvas_gray: np.ndarray, flip_x: bool, flip_y: bool) -> np.
 
 
 # ---------------------------------------------------------------------------
-# Send canvas – uses SerialWorkers for non-blocking writes
+# Send canvas - uses workers for non-blocking writes
 # ---------------------------------------------------------------------------
 
 def send_canvas_to_matrices(
@@ -735,17 +750,17 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Run Doom on Framework 16 LED Matrix modules (optimized build)."
     )
-    p.add_argument("--port",            action="append", help="Serial port, e.g. --port /dev/ttyACM0")
+    p.add_argument("--port",            action="append", help="LED Matrix device path, e.g. --port /dev/ttyACM0")
     p.add_argument("--list",            action="store_true", help="List detected LED Matrix modules and exit.")
     p.add_argument("--brightness",      type=int,   default=100)
     p.add_argument("--fps",             type=float, default=24.0,  help="LED update FPS. Default: 24.")
     p.add_argument("--baud",            type=int,   default=BAUD)
     p.add_argument("--serial-workers",  type=int,   default=2,
-                   help="Background serial threads. Default: 2 (one per panel).")
+                   help="Background device threads. Default: 2 (one per pane).")
     p.add_argument("--serial-burst",    action="store_true",  default=True,
-                   help="Burst serial writes (default ON). Combine all column packets into one OS write.")
+                   help="Stage changed columns before flushing (kept for CLI compatibility).")
     p.add_argument("--no-serial-burst", action="store_false", dest="serial_burst",
-                   help="Disable burst mode (safe fallback for old firmware).")
+                   help="Disable staged-column mode (kept for CLI compatibility).")
     p.add_argument("--cie",             action="store_true",  default=True)
     p.add_argument("--no-cie",          action="store_false", dest="cie")
     p.add_argument("--dither",          choices=["none", "2x2", "4x4", "8x8"], default="4x4")
@@ -806,7 +821,7 @@ def main() -> int:
 
     ports = open_ports(devices, baud=max(9600, int(args.baud)))
     if not ports:
-        print("No usable serial ports opened.")
+        print("No usable LED Matrix devices opened.")
         return 1
 
     brightness_percent = max(0, min(100, args.brightness))
@@ -845,10 +860,10 @@ def main() -> int:
     clock = pygame.time.Clock()
     game  = None
 
-    print(f"Serial packet mode: {'burst' if args.serial_burst else 'safe'}")
+    print(f"LED Matrix SDK column mode: {'staged' if args.serial_burst else 'full-frame fallback'}")
     print(f"scipy acceleration: {_HAVE_SCIPY}")
     print(f"Output resolution:  {canvas_width}x{canvas_height}")
-    print(f"Non-blocking serial workers per port: 1 each ({len(ports)} total)")
+    print(f"Non-blocking LED Matrix workers: 1 each ({len(ports)} total)")
 
     try:
         game, vzd, buttons, buttons_by_name = init_doom(args)
